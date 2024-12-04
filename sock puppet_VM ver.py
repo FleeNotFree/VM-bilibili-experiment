@@ -487,34 +487,45 @@ class ExperimentManager:
         account['watched_videos'].extend(local_watched)
         return account
 
-    def pretrain_users_parallel(self, accounts):
+    def pretrain_users_parallel(self, accounts, batch_size_per_group):
         try:
-            # 区分控制组和实验组账户
-            non_control_accounts = [acc for acc in accounts if acc['group'] != 'control']
+            # 区分 state 和 non-state 账户
+            state_accounts = [acc for acc in accounts if acc['group'] == 'state']
+            non_state_accounts = [acc for acc in accounts if acc['group'] == 'non-state']
             control_accounts = [acc for acc in accounts if acc['group'] == 'control']
 
             # 添加详细日志
             logger.info(f"预训练开始前账户统计:")
-            logger.info(f"总账户数: {len(accounts)}")
-            logger.info(f"需要预训练的账户数: {len(non_control_accounts)}")
-            logger.info(f"控制组账户数: {len(control_accounts)}")
+            logger.info(f"State组账户数: {len(state_accounts)}")
+            logger.info(f"Non-state组账户数: {len(non_state_accounts)}")
+            logger.info(f"Control组账户数: {len(control_accounts)}")
+            logger.info(f"每批处理 {batch_size_per_group} 个state账户和 {batch_size_per_group} 个non-state账户")
 
-            if not accounts:
-                raise ValueError("没有提供要预训练的账户")
+            # 验证 state 和 non-state 账户数量相等
+            if len(state_accounts) != len(non_state_accounts):
+                raise ValueError(
+                    f"State组({len(state_accounts)})和Non-state组({len(non_state_accounts)})账户数量不相等")
 
-            # 存储完成训练的账户
             completed_accounts = []
 
-            # 处理非控制组账户 - 现在使用等于账户数量的线程数
-            if non_control_accounts:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=len(non_control_accounts)) as executor:
-                    # 为每个非控制组账户创建一个任务
+            # 将 state 和 non-state 账户按批次处理
+            for i in range(0, len(state_accounts), batch_size_per_group):
+                batch_state = state_accounts[i:i + batch_size_per_group]
+                batch_non_state = non_state_accounts[i:i + batch_size_per_group]
+                current_batch = batch_state + batch_non_state
+
+                logger.info(f"\n开始处理第 {i // batch_size_per_group + 1} 批账户:")
+                logger.info(f"State组: {[acc['username'] for acc in batch_state]}")
+                logger.info(f"Non-state组: {[acc['username'] for acc in batch_non_state]}")
+
+                # 使用线程池并行处理当前批次的账户
+                with concurrent.futures.ThreadPoolExecutor(max_workers=len(current_batch)) as executor:
                     future_to_account = {
                         executor.submit(self.pretrain_single_user, account): account
-                        for account in non_control_accounts
+                        for account in current_batch
                     }
 
-                    # 等待所有账户完成预训练
+                    # 等待当前批次完成
                     for future in concurrent.futures.as_completed(future_to_account):
                         account = future_to_account[future]
                         try:
@@ -527,6 +538,11 @@ class ExperimentManager:
                             # 即使训练失败也保留账户
                             completed_accounts.append(account)
 
+                # 批次之间添加休息时间
+                rest_time = random.uniform(10, 20)
+                logger.info(f"当前批次完成，休息 {rest_time:.1f} 秒后处理下一批...")
+                time.sleep(rest_time)
+
             # 直接添加控制组账户（不需要预训练）
             completed_accounts.extend(control_accounts)
 
@@ -535,7 +551,7 @@ class ExperimentManager:
             final_non_state_accounts = len([acc for acc in completed_accounts if acc['group'] == 'non-state'])
             final_control_accounts = len([acc for acc in completed_accounts if acc['group'] == 'control'])
 
-            logger.info(f"预训练完成后账户统计:")
+            logger.info(f"\n预训练完成后账户统计:")
             logger.info(f"- State组: {final_state_accounts}")
             logger.info(f"- Non-state组: {final_non_state_accounts}")
             logger.info(f"- Control组: {final_control_accounts}")
@@ -805,7 +821,8 @@ def run_experiment(users_per_group=1):
         logger.info(f"总账户数: {len(all_accounts)}")
 
         logger.info("\n" + "=" * 20 + " 开始预训练 " + "=" * 20)
-        trained_accounts = manager.pretrain_users_parallel(all_accounts)
+        # 将批次大小传入预训练函数
+        trained_accounts = manager.pretrain_users_parallel(all_accounts, PRETRAIN_BATCH_SIZE)
 
         # 验证预训练结果
         logger.info("\n" + "=" * 20 + " 预训练后账户统计 " + "=" * 20)
@@ -816,6 +833,7 @@ def run_experiment(users_per_group=1):
                 raise ValueError(f"{group} 组账户数量不正确，期望 {users_per_group}，实际 {count}")
 
         logger.info("预训练完成，开始数据收集...")
+        # 数据收集阶段不分批，一次性处理所有账户
         results = manager.collect_data_parallel(trained_accounts)
 
         logger.info("\n" + "=" * 20 + " 实验完成 " + "=" * 20)
@@ -825,25 +843,25 @@ def run_experiment(users_per_group=1):
         logger.error(f"实验过程中出错: {str(e)}")
         raise
 
+
 if __name__ == "__main__":
     # ==== 实验基础参数 ====
-    USERS_PER_GROUP = 30  # 每组账户数量（state组2个，non-state组2个，control组2个）
+    USERS_PER_GROUP = 30  # 每组账户数量（state组30个，non-state组30个，control组30个）
 
     # ==== 预训练阶段参数 ====
+    PRETRAIN_BATCH_SIZE = 5  # 每批次处理的每组账户数（比如3表示每批处理3个state + 3个non-state = 6个账户）
     PRE_TRAIN_VIDEOS_PER_USER = 10  # 每个账户预训练要看的视频数
     PRE_TRAIN_VIDEO_DURATION = 1  # 每个视频观看时长（秒）
-    # 预训练将同时运行 USERS_PER_GROUP * 2 个浏览器窗口（state组 + non-state组的账户数）
 
     # ==== 实验数据收集阶段 ====
-    # 不再分批，一次性并行处理所有账户
-    # 并行数 = 所有账户数量 (USERS_PER_GROUP * 3)
+    # 实验阶段不分批，一次性并行处理所有账户
 
     logger.info("实验参数:")
     logger.info(f"- 每组用户数: {USERS_PER_GROUP}")
     logger.info("\n预训练阶段:")
+    logger.info(f"- 预训练批次大小: 每组{PRETRAIN_BATCH_SIZE}个账户（总共{PRETRAIN_BATCH_SIZE * 2}个/批）")
     logger.info(f"- 每用户观看视频数: {PRE_TRAIN_VIDEOS_PER_USER}")
     logger.info(f"- 每视频观看时长: {PRE_TRAIN_VIDEO_DURATION}秒")
-    logger.info(f"- 同时运行的浏览器窗口数: {USERS_PER_GROUP * 2}")
     logger.info("\n数据收集阶段:")
     logger.info(f"- 并行处理所有 {USERS_PER_GROUP * 3} 个账户")
 
